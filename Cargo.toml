@@ -1,0 +1,12 @@
+[package]
+name = "zellij-ssh-manager"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+
+[dependencies]
+glob = "0.3"
+zellij-tile = "0.44.3"
+
+[workspace]

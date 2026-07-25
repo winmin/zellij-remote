@@ -1,0 +1,19 @@
+// Merge these entries into the existing plugins and keybinds.session blocks.
+plugins {
+    ssh-manager location="file:/absolute/path/to/zellij-remote/target/wasm32-wasip1/release/zellij-ssh-manager.wasm" {
+        connector "/absolute/path/to/zellij-remote/bin/zellij-ssh-connector"
+        default_backend "tmux"
+    }
+}
+
+keybinds {
+    session {
+        bind "r" {
+            LaunchOrFocusPlugin "ssh-manager" {
+                floating true
+                move_to_focused_tab true
+            };
+            SwitchToMode "Normal"
+        }
+    }
+}

@@ -1,0 +1,70 @@
+#!/bin/sh
+
+usage() {
+    echo "usage: zellij-ssh-connector --host HOST --backend shell" >&2
+    echo "       zellij-ssh-connector --host HOST --backend tmux|zellij --session SESSION" >&2
+    exit 2
+}
+
+host=
+backend=
+session=
+
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --host|--backend|--session)
+            [ "$#" -ge 2 ] || usage
+            option=$1
+            value=$2
+            case "$option" in
+                --host) host=$value ;;
+                --backend) backend=$value ;;
+                --session) session=$value ;;
+            esac
+            shift 2
+            ;;
+        *) usage ;;
+    esac
+done
+
+[ -n "$host" ] || usage
+case "$backend" in
+    shell)
+        [ -z "$session" ] || usage
+        ;;
+    tmux|zellij)
+        case "$session" in
+            ""|*[!A-Za-z0-9_.-]*) usage ;;
+        esac
+        ;;
+    *) usage ;;
+esac
+
+case "$backend" in
+    tmux) remote_command="exec tmux new-session -A -s '$session'" ;;
+    zellij) remote_command="exec zellij attach --create '$session'" ;;
+esac
+
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+delay=1
+while :; do
+    if [ "$backend" = shell ]; then
+        ssh -tt -- "$host"
+    else
+        ssh -tt -- "$host" "$remote_command"
+    fi
+    status=$?
+    [ "$status" -eq 255 ] || exit "$status"
+
+    if [ "$backend" = shell ]; then
+        printf '\nConnection lost; reconnecting to %s in %ss...\n' "$host" "$delay" >&2
+    else
+        printf '\nConnection lost; reconnecting to %s/%s in %ss...\n' "$host" "$session" "$delay" >&2
+    fi
+    sleep "$delay"
+    if [ "$delay" -lt 16 ]; then
+        delay=$((delay * 2))
+    fi
+done
