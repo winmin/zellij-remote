@@ -1,0 +1,74 @@
+name: Release plugin
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build and release WASM plugin
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.92.0
+        with:
+          targets: wasm32-wasip1
+
+      - name: Check formatting
+        run: cargo fmt --check
+
+      - name: Run Rust tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          host="$(rustc -vV | sed -n 's/^host: //p')"
+          cargo test --target "$host"
+
+      - name: Test connector
+        run: |
+          sh -n bin/zellij-ssh-connector tests/connector.sh
+          sh tests/connector.sh
+
+      - name: Build WASM plugin
+        run: cargo build --target wasm32-wasip1 --release
+
+      - name: Package release assets
+        shell: bash
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          version="${TAG#v}"
+          package="zellij-ssh-manager-${version}"
+          mkdir -p "dist/${package}"
+
+          cp target/wasm32-wasip1/release/zellij-ssh-manager.wasm "dist/${package}/"
+          cp target/wasm32-wasip1/release/zellij-ssh-manager.wasm "dist/${package}.wasm"
+          cp bin/zellij-ssh-connector "dist/${package}/"
+          cp ssh-manager.kdl README.md "dist/${package}/"
+
+          tar -C dist -czf "dist/${package}.tar.gz" "${package}"
+          sha256sum \
+            "dist/${package}.tar.gz" \
+            "dist/${package}.wasm" \
+            > "dist/${package}.sha256"
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          gh release create "$TAG" \
+            "dist/zellij-ssh-manager-${TAG#v}.tar.gz" \
+            "dist/zellij-ssh-manager-${TAG#v}.wasm" \
+            "dist/zellij-ssh-manager-${TAG#v}.sha256" \
+            --title "Zellij SSH Manager ${TAG}" \
+            --generate-notes
