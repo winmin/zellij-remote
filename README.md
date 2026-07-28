@@ -1,6 +1,6 @@
 # Zellij SSH Manager
 
-A standalone Zellij WebAssembly plugin that reads concrete `Host` aliases from `~/.ssh/config`, then opens a local tab running a reconnecting default SSH login shell or a remote tmux or Zellij session.
+A standalone Zellij WebAssembly plugin that reads concrete `Host` aliases from `~/.ssh/config`, then opens a local tab running a reconnecting default SSH login shell, remote tmux/Zellij session, or a pane-oriented tmux workspace.
 
 ## Build
 
@@ -15,7 +15,11 @@ Merge the alias and keybinding entries from `ssh-manager.kdl` into the existing 
 
 The plugin requests access to the session `HOME`, host files, command execution, and Zellij application state. It reads only through Zellij's `/host` mount after mapping that mount to `HOME`.
 
-The connector accepts `--host` with a `shell`, `tmux`, or `zellij` backend. The `shell` backend opens the host's default login shell and does not persist tasks; it takes no session. tmux and Zellij require a safe `--session` name. The connector reconnects indefinitely only when `ssh` exits with status 255, using delays of 1, 2, 4, 8, then 16 seconds.
+The connector accepts `--host` with a `shell`, `tmux`, `tmux-worker`, or `zellij` backend. The `shell` backend opens the host's default login shell and does not persist tasks; it takes no session. tmux, tmux-worker, and Zellij require a safe `--session` name. `tmux-worker` creates a detached session, turns its status line off, and attaches it. The connector reconnects indefinitely only when `ssh` exits with status 255, using delays of 1, 2, 4, 8, then 16 seconds.
+
+## Pane workspace backend
+
+Select **tmux workspace panes** and enter a safe workspace name. The first local tab attaches to remote worker `zr-<workspace>-p0001`; subsequent optional `Alt-Shift-R` / `Alt-Shift-D` bindings send `split-right` / `split-down` to the plugin. For a mapped workspace tab, it runs the local `zellij` CLI (override with the `zellij_cli` plugin setting) to split the tab and attach each new local pane to the next independent remote worker. The plugin keeps this tab-to-workspace mapping in memory, so restarting/reloading it requires creating a new workspace tab. On ordinary tabs, these bindings show the picker with an error rather than splitting.
 
 ## Test
 

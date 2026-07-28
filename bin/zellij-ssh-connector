@@ -2,7 +2,7 @@
 
 usage() {
     echo "usage: zellij-ssh-connector --host HOST --backend shell" >&2
-    echo "       zellij-ssh-connector --host HOST --backend tmux|zellij --session SESSION" >&2
+    echo "       zellij-ssh-connector --host HOST --backend tmux|tmux-worker|zellij --session SESSION" >&2
     exit 2
 }
 
@@ -32,7 +32,7 @@ case "$backend" in
     shell)
         [ -z "$session" ] || usage
         ;;
-    tmux|zellij)
+    tmux|tmux-worker|zellij)
         case "$session" in
             ""|*[!A-Za-z0-9_.-]*) usage ;;
         esac
@@ -42,6 +42,7 @@ esac
 
 case "$backend" in
     tmux) remote_command="exec tmux new-session -A -s '$session'" ;;
+    tmux-worker) remote_command="tmux new-session -Ad -s '$session'; tmux set-option -t '$session' status off; exec tmux attach-session -t '$session'" ;;
     zellij) remote_command="exec zellij attach --create '$session'" ;;
 esac
 

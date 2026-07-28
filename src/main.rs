@@ -2,16 +2,36 @@ mod parser;
 mod state;
 
 use parser::parse_ssh_config;
-use state::{AppState, Backend, CommandSpec, Effect, Input, Stage};
-use std::collections::BTreeMap;
+use state::{worker_session_name, AppState, Backend, CommandSpec, Effect, Input, Stage};
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use zellij_tile::prelude::*;
 
-#[derive(Default)]
+#[derive(Clone)]
+struct Workspace {
+    host: String,
+    workspace: String,
+    next_pane: u32,
+}
+
 struct PluginState {
     app: AppState,
     status: String,
     home_ready: bool,
+    zellij_cli: String,
+    workspaces: HashMap<usize, Workspace>,
+}
+
+impl Default for PluginState {
+    fn default() -> Self {
+        Self {
+            app: AppState::default(),
+            status: String::new(),
+            home_ready: false,
+            zellij_cli: "zellij".to_owned(),
+            workspaces: HashMap::new(),
+        }
+    }
 }
 
 register_plugin!(PluginState);
@@ -23,9 +43,15 @@ impl ZellijPlugin for PluginState {
                 self.app.connector = connector.clone();
             }
         }
+        if let Some(zellij_cli) = configuration.get("zellij_cli") {
+            if !zellij_cli.is_empty() {
+                self.zellij_cli = zellij_cli.clone();
+            }
+        }
         if let Some(default_backend) = configuration.get("default_backend") {
             self.app.backend = match default_backend.as_str() {
                 "shell" => Backend::Shell,
+                "tmux-worker" => Backend::TmuxWorker,
                 "zellij" => Backend::Zellij,
                 _ => Backend::Tmux,
             };
@@ -43,6 +69,7 @@ impl ZellijPlugin for PluginState {
             PermissionType::FullHdAccess,
             PermissionType::RunCommands,
             PermissionType::ChangeApplicationState,
+            PermissionType::ReadApplicationState,
         ]);
     }
 
@@ -92,16 +119,35 @@ impl ZellijPlugin for PluginState {
                 true
             }
             Event::RunCommandResult(exit_code, stdout, stderr, context) => {
-                if context.get("kind").map(String::as_str) != Some("tmux_sessions") {
-                    return false;
+                match context.get("kind").map(String::as_str) {
+                    Some("tmux_sessions") => context
+                        .get("host")
+                        .map(|host| {
+                            self.app
+                                .apply_tmux_sessions_result(host, exit_code, &stdout, &stderr)
+                        })
+                        .unwrap_or(false),
+                    Some("workspace_split") => {
+                        let worker = context
+                            .get("worker")
+                            .map(String::as_str)
+                            .unwrap_or("worker");
+                        if exit_code == Some(0) {
+                            self.status = format!("Opened workspace worker {worker}");
+                        } else {
+                            let stderr = String::from_utf8_lossy(&stderr);
+                            let stdout = String::from_utf8_lossy(&stdout);
+                            let detail = stderr
+                                .lines()
+                                .chain(stdout.lines())
+                                .find(|line| !line.trim().is_empty())
+                                .unwrap_or("zellij new-pane failed");
+                            self.status = format!("Could not open {worker}: {detail}");
+                        }
+                        true
+                    }
+                    _ => false,
                 }
-                context
-                    .get("host")
-                    .map(|host| {
-                        self.app
-                            .apply_tmux_sessions_result(host, exit_code, &stdout, &stderr)
-                    })
-                    .unwrap_or(false)
             }
             Event::Key(key) => {
                 if let Some(input) = map_key(key) {
@@ -109,6 +155,11 @@ impl ZellijPlugin for PluginState {
                         Effect::Close => close_self(),
                         Effect::DiscoverTmuxSessions { host } => self.discover_tmux_sessions(host),
                         Effect::Connect(spec) => self.connect(spec),
+                        Effect::ConnectWorkspace {
+                            spec,
+                            workspace,
+                            next_pane,
+                        } => self.connect_workspace(spec, workspace, next_pane),
                         Effect::Render => return true,
                     }
                 }
@@ -116,6 +167,15 @@ impl ZellijPlugin for PluginState {
             }
             _ => false,
         }
+    }
+
+    fn pipe(&mut self, pipe_message: PipeMessage) -> bool {
+        let direction = match pipe_message.name.as_str() {
+            "split-right" => "right",
+            "split-down" => "down",
+            _ => return false,
+        };
+        self.split_workspace(direction)
     }
 
     fn render(&mut self, rows: usize, cols: usize) {
@@ -147,7 +207,12 @@ impl ZellijPlugin for PluginState {
                     self.app.host.as_deref().unwrap_or("(none)")
                 ));
                 lines.push("Choose backend:".to_owned());
-                for backend in [Backend::Tmux, Backend::Zellij, Backend::Shell] {
+                for backend in [
+                    Backend::Tmux,
+                    Backend::TmuxWorker,
+                    Backend::Zellij,
+                    Backend::Shell,
+                ] {
                     let marker = if backend == self.app.backend {
                         ">"
                     } else {
@@ -155,13 +220,14 @@ impl ZellijPlugin for PluginState {
                     };
                     let label = match backend {
                         Backend::Tmux => "tmux",
+                        Backend::TmuxWorker => "tmux workspace panes",
                         Backend::Zellij => "zellij",
                         Backend::Shell => "shell (default login shell)",
                     };
                     lines.push(format!("{marker} {label}"));
                 }
                 lines.push(String::new());
-                lines.push("↑/↓ or t/z/s | Enter | Esc back".to_owned());
+                lines.push("↑/↓ or t/w/z/s | Enter | Esc back".to_owned());
             }
             Stage::Loading => {
                 lines.push(format!(
@@ -209,6 +275,17 @@ impl ZellijPlugin for PluginState {
                 lines.push("Allowed: A-Z a-z 0-9 _ . -".to_owned());
                 lines.push("Enter connect | Esc back".to_owned());
             }
+            Stage::WorkspaceInput => {
+                lines.push(format!(
+                    "Host: {}  Backend: tmux workspace panes",
+                    self.app.host.as_deref().unwrap_or("(none)")
+                ));
+                lines.push(format!("Workspace: {}", self.app.workspace));
+                lines.push(String::new());
+                lines.push("First worker: zr-<workspace>-p0001".to_owned());
+                lines.push("Allowed: A-Z a-z 0-9 _ . -".to_owned());
+                lines.push("Enter connect | Esc back".to_owned());
+            }
         }
         if let Some(error) = &self.app.error {
             lines.push(format!("Error: {error}"));
@@ -253,6 +330,98 @@ impl PluginState {
             self.app.error = Some("Zellij did not create the connector tab".to_owned());
         }
     }
+
+    fn connect_workspace(&mut self, spec: CommandSpec, workspace: String, next_pane: u32) {
+        let Some(host) = self.app.host.clone() else {
+            self.app.error = Some("No SSH host selected".to_owned());
+            return;
+        };
+        let command = CommandToRun::new_with_args(&spec.program, spec.args);
+        let (tab_id, _pane_id) = open_command_pane_in_new_tab(command, BTreeMap::new());
+        if let Some(tab_id) = tab_id {
+            rename_tab_with_id(tab_id as u64, spec.tab_name);
+            self.workspaces.insert(
+                tab_id,
+                Workspace {
+                    host,
+                    workspace,
+                    next_pane,
+                },
+            );
+            self.status = "Workspace connected; use its split bindings for more workers".to_owned();
+            hide_self();
+        } else {
+            self.app.error = Some("Zellij did not create the workspace tab".to_owned());
+        }
+    }
+
+    fn split_workspace(&mut self, direction: &str) -> bool {
+        let (tab_position, _) = match get_focused_pane_info() {
+            Ok(info) => info,
+            Err(error) => {
+                self.status = format!("Could not find focused tab: {error}");
+                show_self(true);
+                return true;
+            }
+        };
+        let snapshot = match get_session_list() {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                self.status = format!("Could not read Zellij sessions: {error}");
+                show_self(true);
+                return true;
+            }
+        };
+        let Some(session) = snapshot
+            .live_sessions
+            .iter()
+            .find(|session| session.is_current_session)
+        else {
+            self.status = "Could not identify the current Zellij session".to_owned();
+            show_self(true);
+            return true;
+        };
+        let Some(tab) = session.tabs.iter().find(|tab| tab.position == tab_position) else {
+            self.status = "Could not resolve the focused tab's stable ID".to_owned();
+            show_self(true);
+            return true;
+        };
+        let tab_id = tab.tab_id;
+        let Some(workspace) = self.workspaces.get_mut(&tab_id) else {
+            self.status = "The focused tab is not a tmux workspace".to_owned();
+            show_self(true);
+            return true;
+        };
+        let worker = worker_session_name(&workspace.workspace, workspace.next_pane);
+        workspace.next_pane = workspace.next_pane.saturating_add(1);
+        let mut context = BTreeMap::new();
+        context.insert("kind".to_owned(), "workspace_split".to_owned());
+        context.insert("worker".to_owned(), worker.clone());
+        context.insert("tab_id".to_owned(), tab_id.to_string());
+        let command = vec![
+            self.zellij_cli.clone(),
+            "--session".to_owned(),
+            session.name.clone(),
+            "action".to_owned(),
+            "new-pane".to_owned(),
+            "--tab-id".to_owned(),
+            tab_id.to_string(),
+            "--direction".to_owned(),
+            direction.to_owned(),
+            "--".to_owned(),
+            self.app.connector.clone(),
+            "--host".to_owned(),
+            workspace.host.clone(),
+            "--backend".to_owned(),
+            "tmux-worker".to_owned(),
+            "--session".to_owned(),
+            worker,
+        ];
+        let command_refs: Vec<&str> = command.iter().map(String::as_str).collect();
+        run_command(&command_refs, context);
+        self.status = format!("Opening workspace pane to the {direction}...");
+        true
+    }
 }
 
 fn map_key(key: KeyWithModifier) -> Option<Input> {
@@ -278,3 +447,7 @@ fn map_key(key: KeyWithModifier) -> Option<Input> {
         _ => None,
     }
 }
+
+#[cfg(test)]
+#[no_mangle]
+extern "C" fn host_run_plugin_command() {}

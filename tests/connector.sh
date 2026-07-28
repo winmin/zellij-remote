@@ -78,6 +78,14 @@ awk 'NR > 1' "$SSH_LOG" >"$tmp_dir/actual.args"
 cmp -s "$tmp_dir/expected.args" "$tmp_dir/actual.args" || fail "tmux ssh arguments differ"
 
 reset_fakes
+export SSH_STATUSES="0"
+"$connector" --host prod --backend tmux-worker --session zr-project-p0001
+[ "$(cat "$SSH_COUNT")" = "1" ] || fail "worker ssh should run once"
+printf '%s\n' '<-tt>' '<-->' '<prod>' "<tmux new-session -Ad -s 'zr-project-p0001'; tmux set-option -t 'zr-project-p0001' status off; exec tmux attach-session -t 'zr-project-p0001'>" >"$tmp_dir/expected.args"
+awk 'NR > 1' "$SSH_LOG" >"$tmp_dir/actual.args"
+cmp -s "$tmp_dir/expected.args" "$tmp_dir/actual.args" || fail "worker ssh arguments differ"
+
+reset_fakes
 export SSH_STATUSES="255 255 0"
 "$connector" --host dev --backend zellij --session work-2
 [ "$(cat "$SSH_COUNT")" = "3" ] || fail "255 should be retried"
@@ -113,6 +121,8 @@ export SSH_STATUSES="0"
 assert_status 2 "$connector" --host prod --backend screen --session work
 assert_status 2 "$connector" --host prod --backend tmux
 assert_status 2 "$connector" --host prod --backend zellij
+assert_status 2 "$connector" --host prod --backend tmux-worker
+assert_status 2 "$connector" --host prod --backend tmux-worker --session 'bad name'
 assert_status 2 "$connector" --host prod --backend shell --session ignored
 assert_status 2 "$connector" --host prod --backend shell --unrelated value
 assert_status 2 "$connector" --host prod --backend tmux --session 'bad name'

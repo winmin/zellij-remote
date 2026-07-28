@@ -2,6 +2,8 @@
 plugins {
     ssh-manager location="file:/absolute/path/to/zellij-remote/target/wasm32-wasip1/release/zellij-ssh-manager.wasm" {
         connector "/absolute/path/to/zellij-remote/bin/zellij-ssh-connector"
+        // Optional: path to the local Zellij CLI when it is not on Zellij's PATH.
+        zellij_cli "zellij"
         default_backend "tmux"
     }
 }
@@ -14,6 +16,19 @@ keybinds {
                 move_to_focused_tab true
             };
             SwitchToMode "Normal"
+        }
+        // Optional workspace-pane bindings. They deliberately do not change Ctrl-b.
+        bind "Alt Shift r" {
+            MessagePlugin "ssh-manager" {
+                name "split-right"
+            };
+            SwitchToMode "Normal";
+        }
+        bind "Alt Shift d" {
+            MessagePlugin "ssh-manager" {
+                name "split-down"
+            };
+            SwitchToMode "Normal";
         }
     }
 }

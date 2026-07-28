@@ -1,6 +1,7 @@
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Backend {
     Tmux,
+    TmuxWorker,
     Zellij,
     Shell,
 }
@@ -9,6 +10,7 @@ impl Backend {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Tmux => "tmux",
+            Self::TmuxWorker => "tmux-worker",
             Self::Zellij => "zellij",
             Self::Shell => "shell",
         }
@@ -17,14 +19,16 @@ impl Backend {
     fn previous(self) -> Self {
         match self {
             Self::Tmux => Self::Shell,
-            Self::Zellij => Self::Tmux,
+            Self::TmuxWorker => Self::Tmux,
+            Self::Zellij => Self::TmuxWorker,
             Self::Shell => Self::Zellij,
         }
     }
 
     fn next(self) -> Self {
         match self {
-            Self::Tmux => Self::Zellij,
+            Self::Tmux => Self::TmuxWorker,
+            Self::TmuxWorker => Self::Zellij,
             Self::Zellij => Self::Shell,
             Self::Shell => Self::Tmux,
         }
@@ -38,6 +42,7 @@ pub enum Stage {
     Loading,
     TmuxSessionSelection,
     SessionInput,
+    WorkspaceInput,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -55,8 +60,15 @@ pub enum Input {
 pub enum Effect {
     Render,
     Close,
-    DiscoverTmuxSessions { host: String },
+    DiscoverTmuxSessions {
+        host: String,
+    },
     Connect(CommandSpec),
+    ConnectWorkspace {
+        spec: CommandSpec,
+        workspace: String,
+        next_pane: u32,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -75,6 +87,8 @@ pub struct AppState {
     pub host: Option<String>,
     pub backend: Backend,
     pub session: String,
+    pub workspace: String,
+    pub next_pane: u32,
     pub tmux_sessions: Vec<String>,
     pub connector: String,
     pub error: Option<String>,
@@ -90,6 +104,8 @@ impl Default for AppState {
             host: None,
             backend: Backend::Tmux,
             session: "work".to_owned(),
+            workspace: "work".to_owned(),
+            next_pane: 1,
             tmux_sessions: Vec::new(),
             connector: "zellij-ssh-connector".to_owned(),
             error: None,
@@ -120,6 +136,7 @@ impl AppState {
             Stage::Loading => self.handle_loading_input(input),
             Stage::TmuxSessionSelection => self.handle_tmux_session_input(input),
             Stage::SessionInput => self.handle_session_input(input),
+            Stage::WorkspaceInput => self.handle_workspace_input(input),
         }
     }
 
@@ -159,6 +176,7 @@ impl AppState {
             Input::Down => self.backend = self.backend.next(),
             Input::Character('s') | Input::Character('S') => self.backend = Backend::Shell,
             Input::Character('t') | Input::Character('T') => self.backend = Backend::Tmux,
+            Input::Character('w') | Input::Character('W') => self.backend = Backend::TmuxWorker,
             Input::Character('z') | Input::Character('Z') => self.backend = Backend::Zellij,
             Input::Enter if self.backend == Backend::Shell => match self.command_spec() {
                 Ok(spec) => return Effect::Connect(spec),
@@ -172,6 +190,11 @@ impl AppState {
                     return Effect::DiscoverTmuxSessions { host };
                 }
                 self.error = Some("No SSH host selected".to_owned());
+            }
+            Input::Enter if self.backend == Backend::TmuxWorker => {
+                self.workspace = "work".to_owned();
+                self.next_pane = 1;
+                self.stage = Stage::WorkspaceInput;
             }
             Input::Enter => self.stage = Stage::SessionInput,
             Input::Escape => self.stage = Stage::HostSelection,
@@ -228,6 +251,36 @@ impl AppState {
             }
             Input::Enter => match self.command_spec() {
                 Ok(spec) => return Effect::Connect(spec),
+                Err(error) => self.error = Some(error),
+            },
+            Input::Escape => self.stage = Stage::BackendSelection,
+            Input::Cancel => return Effect::Close,
+            _ => {}
+        }
+        Effect::Render
+    }
+
+    fn handle_workspace_input(&mut self, input: Input) -> Effect {
+        match input {
+            Input::Character(character) if is_session_character(character) => {
+                self.workspace.push(character);
+            }
+            Input::Character(_) => {
+                self.error =
+                    Some("Workspace may only contain A-Z, a-z, 0-9, _, . and -".to_owned());
+            }
+            Input::Backspace => {
+                self.workspace.pop();
+            }
+            Input::Enter => match self.workspace_command_spec() {
+                Ok(spec) => {
+                    self.next_pane = self.next_pane.saturating_add(1);
+                    return Effect::ConnectWorkspace {
+                        spec,
+                        workspace: self.workspace.clone(),
+                        next_pane: self.next_pane,
+                    };
+                }
                 Err(error) => self.error = Some(error),
             },
             Input::Escape => self.stage = Stage::BackendSelection,
@@ -303,6 +356,37 @@ impl AppState {
             tab_name: format!("{host}/{}", self.session),
         })
     }
+
+    pub fn workspace_command_spec(&self) -> Result<CommandSpec, String> {
+        let host = self
+            .host
+            .as_ref()
+            .ok_or_else(|| "No SSH host selected".to_owned())?;
+        if !valid_workspace(&self.workspace) {
+            return Err("Workspace must match [A-Za-z0-9_.-]+".to_owned());
+        }
+        let worker = worker_session_name(&self.workspace, self.next_pane);
+        Ok(CommandSpec {
+            program: self.connector.clone(),
+            args: vec![
+                "--host".to_owned(),
+                host.clone(),
+                "--backend".to_owned(),
+                Backend::TmuxWorker.as_str().to_owned(),
+                "--session".to_owned(),
+                worker,
+            ],
+            tab_name: format!("{host}/{}", self.workspace),
+        })
+    }
+}
+
+pub fn worker_session_name(workspace: &str, pane_id: u32) -> String {
+    format!("zr-{workspace}-p{pane_id:04}")
+}
+
+pub fn valid_workspace(workspace: &str) -> bool {
+    valid_session(workspace)
 }
 
 pub fn parse_tmux_sessions_result(
@@ -405,6 +489,8 @@ mod tests {
 
         assert_eq!(state.backend, Backend::Tmux);
         state.handle(Input::Down);
+        assert_eq!(state.backend, Backend::TmuxWorker);
+        state.handle(Input::Down);
         assert_eq!(state.backend, Backend::Zellij);
         state.handle(Input::Down);
         assert_eq!(state.backend, Backend::Shell);
@@ -414,10 +500,14 @@ mod tests {
         assert_eq!(state.backend, Backend::Shell);
         state.handle(Input::Up);
         assert_eq!(state.backend, Backend::Zellij);
+        state.handle(Input::Up);
+        assert_eq!(state.backend, Backend::TmuxWorker);
         state.handle(Input::Character('s'));
         assert_eq!(state.backend, Backend::Shell);
         state.handle(Input::Character('T'));
         assert_eq!(state.backend, Backend::Tmux);
+        state.handle(Input::Character('w'));
+        assert_eq!(state.backend, Backend::TmuxWorker);
         state.handle(Input::Character('z'));
         assert_eq!(state.backend, Backend::Zellij);
         state.handle(Input::Character('S'));
@@ -630,6 +720,52 @@ mod tests {
                 tab_name: "prod/work-2".to_owned(),
             }
         );
+    }
+
+    #[test]
+    fn workspace_validation_and_worker_names_are_safe_and_deterministic() {
+        assert!(valid_workspace("project.2-prod_test"));
+        assert!(!valid_workspace(""));
+        assert!(!valid_workspace("project/work"));
+        assert_eq!(worker_session_name("project", 1), "zr-project-p0001");
+        assert_eq!(worker_session_name("project", 42), "zr-project-p0042");
+    }
+
+    #[test]
+    fn tmux_worker_workspace_connects_with_first_worker_and_next_pane() {
+        let mut state = AppState {
+            stage: Stage::BackendSelection,
+            host: Some("prod".to_owned()),
+            backend: Backend::TmuxWorker,
+            connector: "/opt/bin/connector".to_owned(),
+            ..AppState::default()
+        };
+        assert_eq!(state.handle(Input::Enter), Effect::Render);
+        assert_eq!(state.stage, Stage::WorkspaceInput);
+        state.workspace = "project".to_owned();
+        assert_eq!(
+            state.handle(Input::Enter),
+            Effect::ConnectWorkspace {
+                spec: CommandSpec {
+                    program: "/opt/bin/connector".to_owned(),
+                    args: [
+                        "--host",
+                        "prod",
+                        "--backend",
+                        "tmux-worker",
+                        "--session",
+                        "zr-project-p0001",
+                    ]
+                    .into_iter()
+                    .map(str::to_owned)
+                    .collect(),
+                    tab_name: "prod/project".to_owned(),
+                },
+                workspace: "project".to_owned(),
+                next_pane: 2,
+            }
+        );
+        assert_eq!(state.next_pane, 2);
     }
 
     #[test]
