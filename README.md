@@ -19,7 +19,7 @@ The connector accepts `--host` with a `shell`, `tmux`, `tmux-worker`, or `zellij
 
 ## Pane workspace backend
 
-Select **tmux workspace panes** and enter a safe workspace name. The first local tab attaches to remote worker `zr-<workspace>-p0001`; subsequent optional `Alt-Shift-R` / `Alt-Shift-D` bindings send `split-right` / `split-down` to the plugin. For a mapped workspace tab, it runs the local `zellij` CLI (override with the `zellij_cli` plugin setting) to split the tab and attach each new local pane to the next independent remote worker. The plugin keeps this tab-to-workspace mapping in memory, so restarting/reloading it requires creating a new workspace tab. On ordinary tabs, these bindings show the picker with an error rather than splitting.
+Select **tmux workspace panes** and enter a safe workspace name. The first local tab attaches to remote worker `zr-<workspace>-p0001`; subsequent optional `Alt-Shift-R` / `Alt-Shift-D` bindings send `split-right` / `split-down` to the plugin. The plugin reads the focused tab's connector commands to recover its host, workspace, and highest worker index, then runs the local `zellij` CLI (override with the `zellij_cli` plugin setting) to split the tab and attach the next independent remote worker. This works after the plugin reloads or restarts and needs no custom plugin manifest. On ordinary tabs, or when the focused pane is not a workspace worker, these bindings show the picker with an error rather than splitting.
 
 ## Test
 

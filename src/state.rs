@@ -60,15 +60,9 @@ pub enum Input {
 pub enum Effect {
     Render,
     Close,
-    DiscoverTmuxSessions {
-        host: String,
-    },
+    DiscoverTmuxSessions { host: String },
     Connect(CommandSpec),
-    ConnectWorkspace {
-        spec: CommandSpec,
-        workspace: String,
-        next_pane: u32,
-    },
+    ConnectWorkspace(CommandSpec),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -88,7 +82,6 @@ pub struct AppState {
     pub backend: Backend,
     pub session: String,
     pub workspace: String,
-    pub next_pane: u32,
     pub tmux_sessions: Vec<String>,
     pub connector: String,
     pub error: Option<String>,
@@ -105,7 +98,6 @@ impl Default for AppState {
             backend: Backend::Tmux,
             session: "work".to_owned(),
             workspace: "work".to_owned(),
-            next_pane: 1,
             tmux_sessions: Vec::new(),
             connector: "zellij-ssh-connector".to_owned(),
             error: None,
@@ -193,7 +185,6 @@ impl AppState {
             }
             Input::Enter if self.backend == Backend::TmuxWorker => {
                 self.workspace = "work".to_owned();
-                self.next_pane = 1;
                 self.stage = Stage::WorkspaceInput;
             }
             Input::Enter => self.stage = Stage::SessionInput,
@@ -273,14 +264,7 @@ impl AppState {
                 self.workspace.pop();
             }
             Input::Enter => match self.workspace_command_spec() {
-                Ok(spec) => {
-                    self.next_pane = self.next_pane.saturating_add(1);
-                    return Effect::ConnectWorkspace {
-                        spec,
-                        workspace: self.workspace.clone(),
-                        next_pane: self.next_pane,
-                    };
-                }
+                Ok(spec) => return Effect::ConnectWorkspace(spec),
                 Err(error) => self.error = Some(error),
             },
             Input::Escape => self.stage = Stage::BackendSelection,
@@ -365,7 +349,7 @@ impl AppState {
         if !valid_workspace(&self.workspace) {
             return Err("Workspace must match [A-Za-z0-9_.-]+".to_owned());
         }
-        let worker = worker_session_name(&self.workspace, self.next_pane);
+        let worker = worker_session_name(&self.workspace, 1);
         Ok(CommandSpec {
             program: self.connector.clone(),
             args: vec![
@@ -732,7 +716,7 @@ mod tests {
     }
 
     #[test]
-    fn tmux_worker_workspace_connects_with_first_worker_and_next_pane() {
+    fn tmux_worker_workspace_connects_with_first_worker() {
         let mut state = AppState {
             stage: Stage::BackendSelection,
             host: Some("prod".to_owned()),
@@ -745,27 +729,22 @@ mod tests {
         state.workspace = "project".to_owned();
         assert_eq!(
             state.handle(Input::Enter),
-            Effect::ConnectWorkspace {
-                spec: CommandSpec {
-                    program: "/opt/bin/connector".to_owned(),
-                    args: [
-                        "--host",
-                        "prod",
-                        "--backend",
-                        "tmux-worker",
-                        "--session",
-                        "zr-project-p0001",
-                    ]
-                    .into_iter()
-                    .map(str::to_owned)
-                    .collect(),
-                    tab_name: "prod/project".to_owned(),
-                },
-                workspace: "project".to_owned(),
-                next_pane: 2,
-            }
+            Effect::ConnectWorkspace(CommandSpec {
+                program: "/opt/bin/connector".to_owned(),
+                args: [
+                    "--host",
+                    "prod",
+                    "--backend",
+                    "tmux-worker",
+                    "--session",
+                    "zr-project-p0001",
+                ]
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
+                tab_name: "prod/project".to_owned(),
+            })
         );
-        assert_eq!(state.next_pane, 2);
     }
 
     #[test]

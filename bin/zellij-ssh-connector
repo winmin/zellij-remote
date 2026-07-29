@@ -49,6 +49,12 @@ esac
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
+# A detached Zellij server can inherit TERM=dumb. tmux requires a usable terminal type.
+if [ -z "${TERM:-}" ] || [ "$TERM" = "dumb" ]; then
+    TERM=xterm-256color
+    export TERM
+fi
+
 delay=1
 while :; do
     if [ "$backend" = shell ]; then
