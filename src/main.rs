@@ -2,8 +2,11 @@ mod parser;
 mod state;
 
 use parser::parse_ssh_config;
-use state::{worker_session_name, AppState, Backend, CommandSpec, Effect, Input, Stage};
-use std::collections::BTreeMap;
+use state::{
+    parse_tmux_sessions_result, worker_session_name, worker_workspace_root, AppState, Backend,
+    CommandSpec, Effect, Input, Stage,
+};
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use zellij_tile::prelude::*;
 
@@ -12,6 +15,7 @@ struct PluginState {
     status: String,
     home_ready: bool,
     zellij_cli: String,
+    reserved_workers: HashSet<String>,
 }
 
 impl Default for PluginState {
@@ -21,6 +25,7 @@ impl Default for PluginState {
             status: String::new(),
             home_ready: false,
             zellij_cli: "zellij".to_owned(),
+            reserved_workers: HashSet::new(),
         }
     }
 }
@@ -118,6 +123,9 @@ impl ZellijPlugin for PluginState {
                                 .apply_tmux_sessions_result(host, exit_code, &stdout, &stderr)
                         })
                         .unwrap_or(false),
+                    Some("workspace_workers") => {
+                        self.handle_workspace_workers_result(exit_code, &stdout, &stderr, context)
+                    }
                     Some("workspace_split") => {
                         let worker = context
                             .get("worker")
@@ -126,6 +134,7 @@ impl ZellijPlugin for PluginState {
                         if exit_code == Some(0) {
                             self.status = format!("Opened workspace worker {worker}");
                         } else {
+                            self.reserved_workers.remove(worker);
                             let stderr = String::from_utf8_lossy(&stderr);
                             let stdout = String::from_utf8_lossy(&stdout);
                             let detail = stderr
@@ -217,27 +226,68 @@ impl ZellijPlugin for PluginState {
                 lines.push("↑/↓ or t/w/z/s | Enter | Esc back".to_owned());
             }
             Stage::Loading => {
+                let is_workspace = self.app.backend == Backend::TmuxWorker;
                 lines.push(format!(
-                    "Host: {}  Backend: tmux",
-                    self.app.host.as_deref().unwrap_or("(none)")
+                    "Host: {}  Backend: {}",
+                    self.app.host.as_deref().unwrap_or("(none)"),
+                    if is_workspace {
+                        "tmux workspace panes"
+                    } else {
+                        "tmux"
+                    }
                 ));
                 lines.push(String::new());
-                lines.push("Loading tmux sessions...".to_owned());
+                lines.push(
+                    if is_workspace {
+                        "Loading tmux workspaces..."
+                    } else {
+                        "Loading tmux sessions..."
+                    }
+                    .to_owned(),
+                );
                 lines.push(String::new());
                 lines.push("Esc back".to_owned());
             }
             Stage::TmuxSessionSelection => {
+                let is_workspace = self.app.backend == Backend::TmuxWorker;
                 lines.push(format!(
-                    "Host: {}  Backend: tmux",
-                    self.app.host.as_deref().unwrap_or("(none)")
+                    "Host: {}  Backend: {}",
+                    self.app.host.as_deref().unwrap_or("(none)"),
+                    if is_workspace {
+                        "tmux workspace panes"
+                    } else {
+                        "tmux"
+                    }
                 ));
-                lines.push("Choose a tmux session:".to_owned());
+                lines.push(
+                    if is_workspace {
+                        "Choose a tmux workspace:"
+                    } else {
+                        "Choose a tmux session:"
+                    }
+                    .to_owned(),
+                );
                 let items: Vec<String> = self
                     .app
                     .tmux_sessions
                     .iter()
-                    .cloned()
-                    .chain(std::iter::once("+ New session".to_owned()))
+                    .map(|session| {
+                        if is_workspace {
+                            worker_workspace_root(session)
+                                .expect("worker selector only contains workspace roots")
+                                .to_owned()
+                        } else {
+                            session.clone()
+                        }
+                    })
+                    .chain(std::iter::once(
+                        if is_workspace {
+                            "+ New workspace"
+                        } else {
+                            "+ New session"
+                        }
+                        .to_owned(),
+                    ))
                     .collect();
                 let available = rows.saturating_sub(8).max(1);
                 let start = self
@@ -364,30 +414,90 @@ impl PluginState {
         let Some(workspace) = descriptors.first() else {
             return self.show_split_error("The current tab is not a tmux workspace".to_owned());
         };
-        let next_pane = match next_worker_index(&descriptors, &workspace.host, &workspace.workspace)
+        let mut context = BTreeMap::new();
+        context.insert("kind".to_owned(), "workspace_workers".to_owned());
+        context.insert("host".to_owned(), workspace.host.clone());
+        context.insert("workspace".to_owned(), workspace.workspace.clone());
+        context.insert("direction".to_owned(), direction.to_owned());
+        context.insert("zellij_session".to_owned(), session.name.clone());
+        context.insert("tab_id".to_owned(), tab.tab_id.to_string());
+        self.discover_workspace_workers(&workspace.host, context);
+        self.status = format!("Finding a workspace worker for the {direction} split...");
+        hide_self();
+        true
+    }
+
+    fn discover_workspace_workers(&self, host: &str, context: BTreeMap<String, String>) {
+        run_command(
+            &[
+                "ssh",
+                "-o",
+                "BatchMode=yes",
+                "-o",
+                "ConnectTimeout=5",
+                "--",
+                host,
+                "tmux list-sessions -F '#{session_name}'",
+            ],
+            context,
+        );
+    }
+
+    fn handle_workspace_workers_result(
+        &mut self,
+        exit_code: Option<i32>,
+        stdout: &[u8],
+        stderr: &[u8],
+        context: BTreeMap<String, String>,
+    ) -> bool {
+        let Some(host) = context.get("host") else {
+            return self
+                .show_split_error("Workspace worker lookup did not include a host".to_owned());
+        };
+        let Some(workspace) = context.get("workspace") else {
+            return self.show_split_error(
+                "Workspace worker lookup did not include a workspace".to_owned(),
+            );
+        };
+        let Some(direction) = context.get("direction") else {
+            return self.show_split_error(
+                "Workspace worker lookup did not include a direction".to_owned(),
+            );
+        };
+        let Some(zellij_session) = context.get("zellij_session") else {
+            return self
+                .show_split_error("Workspace worker lookup did not include a session".to_owned());
+        };
+        let Some(tab_id) = context.get("tab_id").and_then(|value| value.parse().ok()) else {
+            return self
+                .show_split_error("Workspace worker lookup did not include a tab ID".to_owned());
+        };
+        let (sessions, error) = parse_tmux_sessions_result(exit_code, stdout, stderr);
+        if let Some(error) = error {
+            return self.show_split_error(error);
+        }
+        let next_pane = match next_remote_worker_index(&sessions, &self.reserved_workers, workspace)
         {
             Ok(index) => index,
             Err(error) => return self.show_split_error(error),
         };
-        let worker = worker_session_name(&workspace.workspace, next_pane);
-        let tab_id = tab.tab_id;
-        let mut context = BTreeMap::new();
-        context.insert("kind".to_owned(), "workspace_split".to_owned());
-        context.insert("worker".to_owned(), worker.clone());
-        context.insert("tab_id".to_owned(), tab_id.to_string());
+        let worker = worker_session_name(workspace, next_pane);
+        self.reserved_workers.insert(worker.clone());
+        let mut split_context = BTreeMap::new();
+        split_context.insert("kind".to_owned(), "workspace_split".to_owned());
+        split_context.insert("worker".to_owned(), worker.clone());
         let command = workspace_split_command(
             &self.zellij_cli,
-            &session.name,
+            zellij_session,
             tab_id,
             direction,
             &self.app.connector,
-            &workspace.host,
+            host,
             &worker,
         );
         let command_refs: Vec<&str> = command.iter().map(String::as_str).collect();
-        run_command(&command_refs, context);
+        run_command(&command_refs, split_context);
         self.status = format!("Opening workspace pane to the {direction}...");
-        hide_self();
         true
     }
 
@@ -453,18 +563,25 @@ fn parse_worker_session(session: &str) -> Option<(&str, u32)> {
     Some((workspace, pane_index.parse().ok()?))
 }
 
-fn next_worker_index(
-    descriptors: &[WorkspaceDescriptor],
-    host: &str,
+fn next_remote_worker_index(
+    sessions: &[String],
+    reserved_workers: &HashSet<String>,
     workspace: &str,
 ) -> Result<u32, String> {
-    descriptors
+    let highest = sessions
         .iter()
-        .filter(|descriptor| descriptor.host == host && descriptor.workspace == workspace)
-        .map(|descriptor| descriptor.pane_index)
-        .max()
-        .and_then(|index| index.checked_add(1))
-        .ok_or_else(|| format!("No tmux workspace workers found for {host}/{workspace}"))
+        .chain(reserved_workers.iter())
+        .filter_map(|session| {
+            let (candidate_workspace, pane_index) = parse_worker_session(session)?;
+            (candidate_workspace == workspace).then_some(pane_index)
+        })
+        .max();
+    match highest {
+        Some(index) => index
+            .checked_add(1)
+            .ok_or_else(|| format!("Worker index overflow for workspace {workspace}")),
+        None => Ok(1),
+    }
 }
 
 fn workspace_split_command(
@@ -566,7 +683,6 @@ mod tests {
                 pane_index: 1,
             })
         );
-        assert_eq!(next_worker_index(&descriptors, "zeroops", "kvm"), Ok(2));
     }
 
     #[test]
@@ -580,37 +696,32 @@ mod tests {
     }
 
     #[test]
-    fn allocates_worker_after_highest_matching_index() {
-        let descriptors = vec![
-            WorkspaceDescriptor {
-                host: "zeroops".to_owned(),
-                workspace: "kvm-prod".to_owned(),
-                pane_index: 1,
-            },
-            WorkspaceDescriptor {
-                host: "zeroops".to_owned(),
-                workspace: "kvm-prod".to_owned(),
-                pane_index: 7,
-            },
-            WorkspaceDescriptor {
-                host: "other".to_owned(),
-                workspace: "kvm-prod".to_owned(),
-                pane_index: 99,
-            },
+    fn allocates_remote_worker_after_existing_and_reserved_indexes() {
+        let sessions = vec![
+            "zr-kvm-prod-p0001".to_owned(),
+            "zr-kvm-prod-p0007".to_owned(),
+            "zr-other-p0099".to_owned(),
+            "ordinary".to_owned(),
         ];
+        let reserved_workers =
+            HashSet::from(["zr-kvm-prod-p0008".to_owned(), "zr-other-p0100".to_owned()]);
 
         assert_eq!(
-            next_worker_index(&descriptors, "zeroops", "kvm-prod"),
-            Ok(8)
+            next_remote_worker_index(&sessions, &reserved_workers, "kvm-prod"),
+            Ok(9)
+        );
+        assert_eq!(
+            next_remote_worker_index(&[], &HashSet::new(), "new-workspace"),
+            Ok(1)
         );
     }
 
     #[test]
-    fn rejects_workspace_without_workers() {
-        assert_eq!(
-            next_worker_index(&[], "zeroops", "kvm"),
-            Err("No tmux workspace workers found for zeroops/kvm".to_owned())
-        );
+    fn failed_new_pane_can_release_worker_reservation() {
+        let mut state = PluginState::default();
+        state.reserved_workers.insert("zr-kvm-p0002".to_owned());
+        assert!(state.reserved_workers.remove("zr-kvm-p0002"));
+        assert!(state.reserved_workers.is_empty());
     }
 
     #[test]

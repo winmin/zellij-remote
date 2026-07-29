@@ -18,13 +18,13 @@ keybinds {
             SwitchToMode "Normal"
         }
         // Optional workspace-pane bindings. They deliberately do not change Ctrl-b.
-        bind "Alt Shift r" {
+        bind "Shift r" {
             MessagePlugin "ssh-manager" {
                 name "split-right"
             };
             SwitchToMode "Normal";
         }
-        bind "Alt Shift d" {
+        bind "Shift d" {
             MessagePlugin "ssh-manager" {
                 name "split-down"
             };

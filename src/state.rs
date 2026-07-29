@@ -174,7 +174,7 @@ impl AppState {
                 Ok(spec) => return Effect::Connect(spec),
                 Err(error) => self.error = Some(error),
             },
-            Input::Enter if self.backend == Backend::Tmux => {
+            Input::Enter if matches!(self.backend, Backend::Tmux | Backend::TmuxWorker) => {
                 if let Some(host) = self.host.clone() {
                     self.tmux_sessions.clear();
                     self.selected = 0;
@@ -182,10 +182,6 @@ impl AppState {
                     return Effect::DiscoverTmuxSessions { host };
                 }
                 self.error = Some("No SSH host selected".to_owned());
-            }
-            Input::Enter if self.backend == Backend::TmuxWorker => {
-                self.workspace = "work".to_owned();
-                self.stage = Stage::WorkspaceInput;
             }
             Input::Enter => self.stage = Stage::SessionInput,
             Input::Escape => self.stage = Stage::HostSelection,
@@ -219,8 +215,13 @@ impl AppState {
                         }
                     };
                 }
-                self.session = "work".to_owned();
-                self.stage = Stage::SessionInput;
+                if self.backend == Backend::TmuxWorker {
+                    self.workspace = "work".to_owned();
+                    self.stage = Stage::WorkspaceInput;
+                } else {
+                    self.session = "work".to_owned();
+                    self.stage = Stage::SessionInput;
+                }
             }
             Input::Escape => self.stage = Stage::BackendSelection,
             Input::Cancel => return Effect::Close,
@@ -299,7 +300,10 @@ impl AppState {
             return false;
         }
 
-        let (sessions, error) = parse_tmux_sessions_result(exit_code, stdout, stderr);
+        let (mut sessions, error) = parse_tmux_sessions_result(exit_code, stdout, stderr);
+        if self.backend == Backend::TmuxWorker {
+            sessions.retain(|session| worker_workspace_root(session).is_some());
+        }
         self.tmux_sessions = sessions;
         self.selected = 0;
         self.error = error;
@@ -371,6 +375,11 @@ pub fn worker_session_name(workspace: &str, pane_id: u32) -> String {
 
 pub fn valid_workspace(workspace: &str) -> bool {
     valid_session(workspace)
+}
+
+pub fn worker_workspace_root(session: &str) -> Option<&str> {
+    let workspace = session.strip_prefix("zr-")?.strip_suffix("-p0001")?;
+    valid_workspace(workspace).then_some(workspace)
 }
 
 pub fn parse_tmux_sessions_result(
@@ -716,7 +725,7 @@ mod tests {
     }
 
     #[test]
-    fn tmux_worker_workspace_connects_with_first_worker() {
+    fn tmux_worker_discovers_and_connects_to_existing_workspace_root() {
         let mut state = AppState {
             stage: Stage::BackendSelection,
             host: Some("prod".to_owned()),
@@ -724,9 +733,84 @@ mod tests {
             connector: "/opt/bin/connector".to_owned(),
             ..AppState::default()
         };
+        assert_eq!(
+            state.handle(Input::Enter),
+            Effect::DiscoverTmuxSessions {
+                host: "prod".to_owned()
+            }
+        );
+        state.apply_tmux_sessions_result(
+            "prod",
+            Some(0),
+            b"zr-project-p0001\nzr-project-p0002\nzr-other-p0001\nordinary\n",
+            b"",
+        );
+        assert_eq!(
+            state.tmux_sessions,
+            vec!["zr-other-p0001", "zr-project-p0001"]
+        );
+        assert_eq!(
+            state.handle(Input::Enter),
+            Effect::Connect(CommandSpec {
+                program: "/opt/bin/connector".to_owned(),
+                args: [
+                    "--host",
+                    "prod",
+                    "--backend",
+                    "tmux-worker",
+                    "--session",
+                    "zr-other-p0001",
+                ]
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
+                tab_name: "prod/zr-other-p0001".to_owned(),
+            })
+        );
+    }
+
+    #[test]
+    fn tmux_worker_selector_offers_new_workspace_and_root_parser_is_strict() {
+        assert_eq!(worker_workspace_root("zr-project-p0001"), Some("project"));
+        assert_eq!(worker_workspace_root("zr-project-p001"), None);
+        assert_eq!(worker_workspace_root("zr-project-p0002"), None);
+        assert_eq!(worker_workspace_root("project"), None);
+
+        let mut state = AppState {
+            stage: Stage::Loading,
+            host: Some("prod".to_owned()),
+            backend: Backend::TmuxWorker,
+            ..AppState::default()
+        };
+        state.apply_tmux_sessions_result("prod", Some(0), b"zr-project-p0002\n", b"");
+        assert!(state.tmux_sessions.is_empty());
         assert_eq!(state.handle(Input::Enter), Effect::Render);
         assert_eq!(state.stage, Stage::WorkspaceInput);
-        state.workspace = "project".to_owned();
+        assert_eq!(state.workspace, "work");
+
+        let mut failed_discovery = AppState {
+            stage: Stage::Loading,
+            host: Some("prod".to_owned()),
+            backend: Backend::TmuxWorker,
+            ..AppState::default()
+        };
+        failed_discovery.apply_tmux_sessions_result("prod", Some(255), b"", b"ssh: timed out\n");
+        assert_eq!(failed_discovery.stage, Stage::TmuxSessionSelection);
+        assert!(failed_discovery.error.is_some());
+        assert_eq!(failed_discovery.handle(Input::Enter), Effect::Render);
+        assert_eq!(failed_discovery.stage, Stage::WorkspaceInput);
+    }
+
+    #[test]
+    fn tmux_worker_workspace_connects_with_first_worker() {
+        let mut state = AppState {
+            stage: Stage::WorkspaceInput,
+            host: Some("prod".to_owned()),
+            backend: Backend::TmuxWorker,
+            connector: "/opt/bin/connector".to_owned(),
+            workspace: "project".to_owned(),
+            ..AppState::default()
+        };
         assert_eq!(
             state.handle(Input::Enter),
             Effect::ConnectWorkspace(CommandSpec {
